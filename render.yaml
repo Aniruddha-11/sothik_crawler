@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: smart-crawler-backend
+    env: python
+    buildCommand: |
+      python -m pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.0
+      - key: ORACLE_USER
+        sync: false
+      - key: ORACLE_PASSWORD
+        sync: false
+      - key: ORACLE_DSN_JSONDB
+        sync: false
+      - key: ORACLE_DSN_VECTDB
+        sync: false
+      - key: WALLET_LOCATION
+        value: /opt/render/project/wallet_jsondb
+      - key: CONFIG_DIR
+        value: /opt/render/project/wallet_jsondb
+      - key: WALLET_PASSWORD
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: FLASK_ENV
+        value: production

@@ -1,0 +1,40 @@
+name: IMAGE BUILD
+
+on:
+  push:
+    branches:
+      - Master
+  workflow_dispatch:
+
+env:
+  EKS_CLUSTER_NAME: shothik-prod
+  AWS_REGION: us-east-1
+
+jobs:
+  push-store-image:
+    runs-on: ubuntu-latest
+    # permissions:
+    #   packages: write
+    defaults:
+      run:
+        working-directory: "."
+    steps:
+      - name: "Checkout GitHub Action"
+        uses: actions/checkout@main
+
+      - name: "Login to GitHub Container Registry"
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ridz-shothikai
+          password: ${{secrets.ACCESS_TOKEN}}
+
+      - name: 'Set Short Commit Hash'
+        id: vars
+        run: echo "SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_ENV
+
+
+      - name: "Build And Push Image"
+        run: |
+          docker build --no-cache --tag ghcr.io/ridz-shothikai/smart-crawler:${{ env.SHORT_SHA }} --build-arg GITHUB_PAT=${{ secrets.ACCESS_TOKEN }} . 
+          docker push ghcr.io/ridz-shothikai/smart-crawler:${{ env.SHORT_SHA }}
