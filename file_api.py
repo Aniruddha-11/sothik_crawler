@@ -4844,46 +4844,14 @@ def get_source_url_status(user_id):
             'timestamp': datetime.now().isoformat()
         }), 500
 
-def get_source_url_limit(user_id, source_url):
-    """
-    Get the link limit set for a specific source URL.
-    
-    Args:
-        user_id: User ID
-        source_url: Source URL
-        
-    Returns:
-        int: The link limit or None if not found
-    """
-    try:
-        with get_jsondb_connection() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute("""
-                    SELECT PAGE_LIMIT FROM {0}
-                    WHERE USER_ID = :user_id AND SOURCE_URL = :source_url
-                """.format(SOURCE_URLS_TABLE), 
-                   user_id=user_id, source_url=source_url)
-                
-                row = cursor.fetchone()
-                if row and row[0] is not None:
-                    return int(row[0])
-        return None  # Default if not found
-    except Exception as e:
-        print(f"Error getting source URL limit: {str(e)}")
-        traceback.print_exc()
-        return None
+
 
 @file_api.route('/get-scrapped-links', methods=['GET'])
 @token_required
 def realtime_scrapped_links(user_id):
-    """Get the count of scraped links with optimized DB connection, respecting link limit"""
+    """Get the count of scraped links with optimized DB connection"""
     try:
         source_url = request.args.get('source_url')
-        
-        # Get the link limit for this source URL
-        link_limit = None
-        if source_url:
-            link_limit = get_source_url_limit(user_id, source_url)
         
         with get_jsondb_connection() as connection:
             with connection.cursor() as cursor:
@@ -4901,18 +4869,10 @@ def realtime_scrapped_links(user_id):
                 cursor.execute(query, params)
                 scraped_count = cursor.fetchone()[0]
                 
-                # Respect the link limit if specified
-                if link_limit is not None and link_limit > 0:
-                    reported_count = min(scraped_count, link_limit)
-                    print(f"Limiting reported scraped links from {scraped_count} to limit of {link_limit}")
-                else:
-                    reported_count = scraped_count
-        
         return jsonify({
             'status': 'success',
-            'scrapped_links': reported_count,
+            'scrapped_links': scraped_count,
             'source_url': source_url,
-            'link_limit': link_limit,
             'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
@@ -4923,39 +4883,12 @@ def realtime_scrapped_links(user_id):
 @file_api.route('/get-pending-links', methods=['GET'])
 @token_required
 def realtime_pending_links(user_id):
-    """Get the count of pending links with optimized DB connection, respecting link limit"""
+    """Get the count of pending links with optimized DB connection"""
     try:
         source_url = request.args.get('source_url')
         
-        # Get the link limit for this source URL
-        link_limit = None
-        if source_url:
-            link_limit = get_source_url_limit(user_id, source_url)
-        
         with get_jsondb_connection() as connection:
             with connection.cursor() as cursor:
-                # First get total links to check against limit
-                total_query = """
-                    SELECT COUNT(*) FROM {0}
-                    WHERE USER_ID = :user_id
-                """.format(LINKS_TO_SCRAP_TABLE)
-                
-                total_params = {'user_id': user_id}
-                
-                if source_url:
-                    total_query += " AND TOP_LEVEL_SOURCE = :source_url"
-                    total_params['source_url'] = source_url
-                    
-                cursor.execute(total_query, total_params)
-                total_count = cursor.fetchone()[0]
-                
-                # Apply link limit to total if needed
-                if link_limit is not None and link_limit > 0:
-                    effective_total = min(total_count, link_limit)
-                else:
-                    effective_total = total_count
-                
-                # Now get pending count
                 query = """
                     SELECT COUNT(*) FROM {0}
                     WHERE (IS_PROCESSED = 'false' OR IS_PROCESSED IS NULL)
@@ -4971,25 +4904,10 @@ def realtime_pending_links(user_id):
                 cursor.execute(query, params)
                 pending_count = cursor.fetchone()[0]
                 
-                # Respect the link limit for pending links
-                if link_limit is not None and link_limit > 0:
-                    # Calculate what portion of pending links is within the limit
-                    if total_count > 0:
-                        # Use proportion of total links that are pending
-                        pending_ratio = pending_count / total_count
-                        reported_pending = min(int(effective_total * pending_ratio), effective_total)
-                    else:
-                        reported_pending = 0
-                    print(f"Adjusted pending links from {pending_count} to {reported_pending} based on limit {link_limit}")
-                else:
-                    reported_pending = pending_count
-        
         return jsonify({
             'status': 'success',
-            'pending_links': reported_pending,
-            'total_links': effective_total,
+            'pending_links': pending_count,
             'source_url': source_url,
-            'link_limit': link_limit,
             'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
@@ -5052,8 +4970,7 @@ def realtime_total_words_scrapped(user_id):
 @token_required
 def get_discovered_links(user_id):
     """
-    Get counts and statistics for discovered links associated with a parent source URL,
-    respecting the link limit set during recursive crawl.
+    Get counts and statistics for discovered links associated with a parent source URL
     
     Query params:
     - source_url: The parent source URL to filter by
@@ -5065,9 +4982,6 @@ def get_discovered_links(user_id):
         # Validate required parameter
         if not source_url:
             return standardize_error_response('source_url parameter is required.', 'MISSING_PARAM', 400)
-        
-        # Get the link limit for this source URL
-        link_limit = get_source_url_limit(user_id, source_url)
         
         with get_jsondb_connection() as connection:
             with connection.cursor() as cursor:
@@ -5091,47 +5005,10 @@ def get_discovered_links(user_id):
                         'status': 'success',
                         'total_links': 0,
                         'source_url': source_url,
-                        'link_limit': link_limit,
                         'timestamp': datetime.now().isoformat()
                     })
                 
-                # Get total links
-                total_links = stats_row[0]
-                
-                # If we have a link limit, respect it for reporting total links
-                if link_limit is not None and link_limit > 0:
-                    reported_total = min(total_links, link_limit)
-                    print(f"Limiting reported links from {total_links} to limit of {link_limit}")
-                    
-                    # Adjust statistics proportionally if necessary
-                    if total_links > link_limit:
-                        adjustment_ratio = float(link_limit) / total_links
-                        adjusted_stats = [
-                            min(int(stats_row[1] * adjustment_ratio), link_limit),  # crawled_links
-                            min(int(stats_row[2] * adjustment_ratio), link_limit),  # processed_links
-                            min(int(stats_row[3] * adjustment_ratio), link_limit),  # failed_links
-                            min(int(stats_row[4] * adjustment_ratio), link_limit),  # error_count
-                            min(int(stats_row[5] * adjustment_ratio), link_limit)   # text_indicator_count
-                        ]
-                    else:
-                        adjusted_stats = [
-                            stats_row[1],  # crawled_links
-                            stats_row[2],  # processed_links
-                            stats_row[3],  # failed_links
-                            stats_row[4],  # error_count
-                            stats_row[5]   # text_indicator_count
-                        ]
-                else:
-                    reported_total = total_links
-                    adjusted_stats = [
-                        stats_row[1],  # crawled_links
-                        stats_row[2],  # processed_links
-                        stats_row[3],  # failed_links
-                        stats_row[4],  # error_count
-                        stats_row[5]   # text_indicator_count
-                    ]
-                
-                # Get domain statistics with optimized query but respect link_limit
+                # Get domain statistics with optimized query
                 domain_query = """
                     SELECT 
                         CASE 
@@ -5155,31 +5032,21 @@ def get_discovered_links(user_id):
                 cursor.execute(domain_query, source_url=source_url, user_id=user_id)
                 domain_stats = [{'domain': row[0], 'count': row[1]} for row in cursor.fetchall()]
                 
-                # If we have a link_limit, adjust domain stats
-                if link_limit is not None and link_limit > 0 and total_links > link_limit:
-                    # Adjust domain counts proportionally
-                    total_domain_count = sum(d['count'] for d in domain_stats)
-                    if total_domain_count > 0:
-                        adjustment_ratio = float(link_limit) / total_domain_count
-                        for domain in domain_stats:
-                            domain['count'] = min(int(domain['count'] * adjustment_ratio), link_limit)
-                
                 # Build response with just the counts and statistics
                 return jsonify({
                     'status': 'success',
-                    'total_links': reported_total,
+                    'total_links': stats_row[0],
                     'source_url': source_url,
-                    'link_limit': link_limit,
                     'stats': {
-                        'total': reported_total,
-                        'crawled': adjusted_stats[0],
-                        'processed': adjusted_stats[1],
-                        'failed': adjusted_stats[2],
-                        'error_count': adjusted_stats[3],
-                        'text_indicator_count': adjusted_stats[4]
+                        'total': stats_row[0],
+                        'crawled': stats_row[1],
+                        'processed': stats_row[2],
+                        'failed': stats_row[3],
+                        'error_count': stats_row[4],
+                        'text_indicator_count': stats_row[5]
                     },
-                    'crawl_progress': round((adjusted_stats[0] / reported_total) * 100, 1) if reported_total > 0 else 0,
-                    'processing_progress': round((adjusted_stats[1] / reported_total) * 100, 1) if reported_total > 0 else 0,
+                    'crawl_progress': round((stats_row[1] / stats_row[0]) * 100, 1) if stats_row[0] > 0 else 0,
+                    'processing_progress': round((stats_row[2] / stats_row[0]) * 100, 1) if stats_row[0] > 0 else 0,
                     'domain_stats': domain_stats,
                     'timestamp': datetime.now().isoformat()
                 })
@@ -5192,9 +5059,9 @@ def get_discovered_links(user_id):
 @file_api.route('/scrapped-sub-links', methods=['POST'])
 def scrapped_sub_links():
     """
-    Fetch links related to a specific source URL with pagination,
-    respecting the link limit set during recursive crawl.
-    Returns 10 URLs at a time with their processing status.
+    Fetch links related to a specific source URL with pagination
+    Returns 10 URLs at a time with their processing status
+    Now includes user_id filtering for proper isolation
     """
     try:
         data = request.get_json()
@@ -5242,11 +5109,11 @@ def scrapped_sub_links():
         
         print(f"Fetching links for source_url: {source_url}, user_id: {user_id}, page: {page}")
         
-        # Get the link limit for this source URL
-        link_limit = get_source_url_limit(user_id, source_url)
-        
         with get_jsondb_connection() as connection:
             with connection.cursor() as cursor:
+                # Calculate pagination parameters
+                offset = (page - 1) * page_size
+                
                 # Get total count for pagination - now with user_id filter
                 cursor.execute("""
                     SELECT COUNT(*) FROM {0}
@@ -5254,42 +5121,6 @@ def scrapped_sub_links():
                 """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url, user_id=user_id)
                 
                 total_links = cursor.fetchone()[0]
-                
-                # Apply link limit if set
-                if link_limit is not None and link_limit > 0:
-                    effective_total = min(total_links, link_limit)
-                else:
-                    effective_total = total_links
-                
-                # Calculate pagination parameters
-                total_pages = (effective_total + page_size - 1) // page_size  # Ceiling division
-                
-                # Adjust page if it exceeds total_pages
-                if page > total_pages and total_pages > 0:
-                    page = total_pages
-                
-                # Calculate pagination parameters
-                offset = (page - 1) * page_size
-                limit = min(page_size, effective_total - offset)
-                
-                if limit <= 0:
-                    # No more data to fetch
-                    return jsonify({
-                        'status': 'success',
-                        'data': [],
-                        'pagination': {
-                            'page': page,
-                            'page_size': page_size,
-                            'total_items': effective_total,
-                            'total_pages': total_pages,
-                            'has_next': False,
-                            'has_prev': page > 1
-                        },
-                        'source_url': source_url,
-                        'user_id': user_id,
-                        'link_limit': link_limit,
-                        'timestamp': datetime.now().isoformat()
-                    })
                 
                 # Fetch the paginated links - now with user_id filter
                 cursor.execute(f"""
@@ -5300,7 +5131,7 @@ def scrapped_sub_links():
                         WHERE TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
                     ) 
                     WHERE rn > :offset AND rn <= :end_row
-                """, source_url=source_url, user_id=user_id, offset=offset, end_row=(offset + limit))
+                """, source_url=source_url, user_id=user_id, offset=offset, end_row=(offset + page_size))
                 
                 links_data = []
                 
@@ -5320,6 +5151,7 @@ def scrapped_sub_links():
                     })
                 
                 # Calculate pagination metadata
+                total_pages = (total_links + page_size - 1) // page_size  # Ceiling division
                 has_next = page < total_pages
                 has_prev = page > 1
                 
@@ -5329,14 +5161,13 @@ def scrapped_sub_links():
             'pagination': {
                 'page': page,
                 'page_size': page_size,
-                'total_items': effective_total,
+                'total_items': total_links,
                 'total_pages': total_pages,
                 'has_next': has_next,
                 'has_prev': has_prev
             },
             'source_url': source_url,
-            'user_id': user_id,
-            'link_limit': link_limit,
+            'user_id': user_id,  # Include user_id in response for transparency
             'timestamp': datetime.now().isoformat()
         })
         
@@ -5349,7 +5180,7 @@ def scrapped_sub_links():
             'traceback': traceback.format_exc(),
             'timestamp': datetime.now().isoformat()
         }), 500
-    
+        
 @file_api.route('/all-documents', methods=['GET'])
 @token_required
 def get_all_documents(user_id):
