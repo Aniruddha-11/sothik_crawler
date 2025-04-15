@@ -31,11 +31,7 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'your-secret-key-fallback')
 app = Flask(__name__)
 
 # Configure CORS with Flask-CORS
-allowed_origins = [
-    'http://localhost:3000',  # Local development
-    'https://smart-crawler-fe.vercel.app',
-    'https://smart-crawler-6ghm35ek8-aniruddha-mukherjees-projects-00946ecf.vercel.app',
-]
+allowed_origins = ["*"]
 
 # Add any CORS_ORIGINS from environment variables
 cors_origins = os.getenv('CORS_ORIGINS', '')
