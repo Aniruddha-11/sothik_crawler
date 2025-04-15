@@ -13,6 +13,11 @@ from prefetch_api import prefetch_api
 from connection import get_jsondb_connection, initialize_jsondb_connection_pool, initialize_vectdb_connection_pool, connect_to_jsondb, check_connection_pools
 from oracle_chatbot import clear_all_caches
 
+# Check if we're in VM mode
+VM_MODE = os.getenv('VM_MODE', 'true').lower() in ('true', '1', 'yes')
+ENABLE_VECTORIZATION = os.getenv('ENABLE_VECTORIZATION', 'false' if VM_MODE else 'true').lower() in ('true', '1', 'yes')
+ENABLE_PREFETCH = os.getenv('ENABLE_PREFETCH', 'false').lower() in ('true', '1', 'yes')
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -23,6 +28,61 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+logger.info(f"Starting application - VM Mode: {VM_MODE}")
+logger.info(f"Vectorization enabled: {ENABLE_VECTORIZATION}")
+logger.info(f"Prefetch enabled: {ENABLE_PREFETCH}")
+
+# Add resource monitoring
+def check_resources():
+    """Monitor resource usage"""
+    try:
+        import psutil
+        
+        memory = psutil.virtual_memory()
+        cpu_percent = psutil.cpu_percent()
+        
+        logger.info(f"Memory usage: {memory.percent}% ({memory.used / 1024 / 1024:.1f} MB)")
+        logger.info(f"CPU usage: {cpu_percent}%")
+        
+        # Force garbage collection if memory usage is high
+        if memory.percent > 80:
+            logger.warning("High memory usage detected! Cleaning caches...")
+            clear_all_caches()
+            
+            import gc
+            gc.collect()
+            
+            # Check memory again after cleaning
+            memory_after = psutil.virtual_memory()
+            logger.info(f"Memory after cleanup: {memory_after.percent}% ({memory_after.used / 1024 / 1024:.1f} MB)")
+    except ImportError:
+        logger.warning("psutil not installed, skipping resource monitoring")
+    except Exception as e:
+        logger.error(f"Error checking resources: {e}")
+
+# Initialize a monitoring thread
+def start_resource_monitor():
+    def monitor_worker():
+        while True:
+            try:
+                check_resources()
+                time.sleep(300 if VM_MODE else 60)  # Check less frequently in VM mode
+            except Exception as e:
+                logger.error(f"Error in resource monitor: {e}")
+                time.sleep(120)  # Wait longer on error
+    
+    from threading import Thread
+    monitor_thread = Thread(target=monitor_worker, daemon=True)
+    monitor_thread.start()
+    logger.info("Resource monitoring started")
+
+# Start resource monitoring if we're in VM mode
+if VM_MODE:
+    try:
+        start_resource_monitor()
+    except Exception as e:
+        logger.error(f"Could not start resource monitor: {e}")
 
 # Get environment variables
 SECRET_KEY = os.getenv('SECRET_KEY', 'your-secret-key-fallback')
@@ -42,42 +102,44 @@ if cors_origins:
 # Apply CORS to the app with configuration
 CORS(app, resources={r"/*": {"origins": allowed_origins, "supports_credentials": True}})
 
-# Initialize database connection pools
-from file_api import initialize_tables
-from user_api import initialize_user_tables
-from oracle_chatbot import (
-    initialize_json_database, 
-    start_cache_cleaning_daemon  # Import the cache cleaning daemon function
-)
-
-# Performance optimizations - initialize pools with better settings
+# Initialize database connection pools - now with more conservative settings for VM mode
 initialize_jsondb_connection_pool(use_wallet=True)
 initialize_vectdb_connection_pool(use_wallet=True)
 
-# Initialize the chatbot JSON database
-chatbot_jsondb_connection = connect_to_jsondb()
-if chatbot_jsondb_connection:
-    initialize_json_database(chatbot_jsondb_connection)
-    print("Chatbot database initialized successfully")
-    chatbot_jsondb_connection.close()
-else:
-    print("WARNING: Failed to initialize chatbot database connection")
+# Check connection pools during startup
+pool_status = check_connection_pools()
+logger.info(f"Connection pool status at startup: {pool_status}")
+
+# Initialize the chatbot JSON database - only if vectorization is enabled
+if ENABLE_VECTORIZATION:
+    try:
+        from oracle_chatbot import initialize_json_database
+        chatbot_jsondb_connection = connect_to_jsondb()
+        if chatbot_jsondb_connection:
+            initialize_json_database(chatbot_jsondb_connection)
+            print("Chatbot database initialized successfully")
+            chatbot_jsondb_connection.close()
+        else:
+            print("WARNING: Failed to initialize chatbot database connection")
+    except Exception as init_error:
+        logger.error(f"Error initializing chatbot database: {init_error}")
+        traceback.print_exc()
 
 # Initialize tables
+from file_api import initialize_tables
 initialize_tables()
 
 # Initialize user tables
+from user_api import initialize_user_tables
 initialize_user_tables()
 
-# Start cache cleaning daemon for optimized performance
-start_cache_cleaning_daemon()
+# Start cache cleaning daemon for optimized performance - only if not in VM mode
+if not VM_MODE:
+    from oracle_chatbot import start_cache_cleaning_daemon
+    start_cache_cleaning_daemon()
 
-# clear cache
-
+# Clear cache on startup
 clear_all_caches()
-
-
-
 
 # Standardized error response function
 def standardize_error_response(error, code=None, status_code=500, process_time=None):
@@ -115,7 +177,7 @@ def standardize_error_response(error, code=None, status_code=500, process_time=N
         # If process_time is not provided but request has start_time, calculate it
         response['process_time'] = f"{time.time() - request.start_time:.2f}s"
         
-    if traceback_str and status_code >= 500:
+    if traceback_str and status_code >= 500 and not VM_MODE:  # Only include traceback in non-VM mode
         # Include traceback in response for server errors
         logger.error(f"Server error: {error_message}\n{traceback_str}")
         response['error_details'] = traceback_str
@@ -163,10 +225,28 @@ def health_check():
     # Check connection pools health
     pool_status = check_connection_pools()
     
+    # In VM mode, also do a memory check
+    memory_status = {}
+    if VM_MODE:
+        try:
+            import psutil
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_status = {
+                "memory_usage_mb": memory_info.rss / 1024 / 1024,
+                "memory_percent": process.memory_percent()
+            }
+        except ImportError:
+            memory_status = {"message": "psutil not installed"}
+        except Exception as e:
+            memory_status = {"error": str(e)}
+    
     return {
         "status": "healthy",
         "version": "1.0.0",
         "pools": pool_status,
+        "vm_mode": VM_MODE,
+        "memory": memory_status,
         "timestamp": datetime.now().isoformat()
     }, 200
 
@@ -439,6 +519,15 @@ def vectorization_ready_direct():
     if request.method == 'OPTIONS':
         return options_route('')
     
+    # Return "disabled" response if vectorization is not enabled
+    if not ENABLE_VECTORIZATION:
+        return jsonify({
+            'status': 'disabled',
+            'message': 'Vectorization is disabled in this environment',
+            'timestamp': datetime.now().isoformat(),
+            'process_time': f"{time.time() - start_time:.2f}s"
+        })
+    
     user_id = verify_token()
     if not user_id:
         return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
@@ -454,6 +543,15 @@ def vectorization_status_direct():
     start_time = time.time()
     if request.method == 'OPTIONS':
         return options_route('')
+    
+    # Return "disabled" response if vectorization is not enabled
+    if not ENABLE_VECTORIZATION:
+        return jsonify({
+            'status': 'disabled',
+            'message': 'Vectorization is disabled in this environment',
+            'timestamp': datetime.now().isoformat(),
+            'process_time': f"{time.time() - start_time:.2f}s"
+        })
     
     user_id = verify_token()
     if not user_id:
@@ -498,6 +596,30 @@ def chatbot_chat_direct():
                 'process_time': f"{time.time() - start_time:.2f}s",
                 'timestamp': datetime.now().isoformat()
             }), 400
+        
+        # In VM mode, provide a simple response to simple greetings
+        if VM_MODE and len(message.strip()) < 20:
+            import re
+            greeting_patterns = [
+                r'^hi\s*$', r'^hello\s*$', r'^hey\s*$', r'^greetings\s*$', 
+                r'^how are you', r'^how\'s it going', r'^how r u', r'^what\'s up',
+                r'^good morning', r'^good afternoon', r'^good evening',
+                r'^thanks', r'^thank you'
+            ]
+            is_greeting = any(re.search(pattern, message.lower()) for pattern in greeting_patterns)
+            
+            if is_greeting:
+                greeting_response = "Hello! I'm your AI assistant for answering questions about the content you've provided. What would you like to know about this topic?"
+                return jsonify({
+                    'status': 'success',
+                    'answer': greeting_response,
+                    'sources': [],
+                    'session_id': session_id or str(int(time.time())),
+                    'title': f"Conversation about {source_level_url}",
+                    'process_time': f"{time.time() - start_time:.2f}s",
+                    'timestamp': datetime.now().isoformat(),
+                    'source_level_url': source_level_url
+                })
         
         # Extract user_id from the Authorization header
         user_id = verify_token()
@@ -568,6 +690,7 @@ def chatbot_chat_direct():
                         yield f'data: {error_json}\n\n'
                 
                 # Return streaming response
+                from flask import Response
                 return Response(
                     generate(),
                     mimetype='text/event-stream',
@@ -624,7 +747,7 @@ def chatbot_chat_direct():
         return jsonify({
             'status': 'error',
             'message': str(e),
-            'error_details': traceback.format_exc(),
+            'error_details': traceback.format_exc() if not VM_MODE else None,  # Only include traceback in non-VM mode
             'process_time': f"{time.time() - start_time:.2f}s",
             'timestamp': datetime.now().isoformat()
         }), 500
@@ -645,12 +768,11 @@ def chatbot_conversations_direct():
             if not user_id:
                 return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
         
-        # Use connection pool
+        # Use connection pool with context manager
         with get_jsondb_connection() as jsondb_connection:
             # Get all conversations with improved function, passing user_id
             import asyncio
-            
-            # Set a timeout for conversations request
+        # Set a timeout for conversations request
             conversations = asyncio.run(asyncio.wait_for(
                 get_all_conversations(jsondb_connection, user_id),
                 timeout=15.0  # 15 second timeout
@@ -783,50 +905,87 @@ def chatbot_update_title_direct(session_id):
         traceback.print_exc()
         return standardize_error_response(str(e), 'UPDATE_TITLE_ERROR', 500)
 
-# Add these routes for the prefetch API
-@app.route('/api/prefetch/prefetch', methods=['POST', 'OPTIONS'])
-def prefetch_direct():
-    start_time = time.time()
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    # Forward to the prefetch API
-    from prefetch_api import prefetch_context
-    result = prefetch_context()
-    
-    # Add performance timing if not already present
-    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], dict) and 'process_time' not in result[0]:
-        result[0]['process_time'] = f"{time.time() - start_time:.2f}s"
-    return result
+# Disable vectorization endpoint if not enabled
+if not ENABLE_VECTORIZATION:
+    @app.route('/api/chatbot/vectorize', methods=['POST', 'OPTIONS'])
+    def vectorize_disabled():
+        if request.method == 'OPTIONS':
+            return options_route('')
+        return jsonify({
+            'status': 'info',
+            'message': 'Vectorization is disabled in this environment',
+            'timestamp': datetime.now().isoformat()
+        })
 
-@app.route('/api/prefetch/status', methods=['GET', 'OPTIONS'])
-def prefetch_status_direct():
-    start_time = time.time()
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    # Forward to the prefetch API
-    from prefetch_api import get_prefetch_status
-    result = get_prefetch_status()
-    
-    # Add performance timing if not already present
-    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], dict) and 'process_time' not in result[0]:
-        result[0]['process_time'] = f"{time.time() - start_time:.2f}s"
-    return result
+# Disable prefetch endpoints if not enabled
+if not ENABLE_PREFETCH:
+    @app.route('/api/prefetch/prefetch', methods=['POST', 'OPTIONS'])
+    def prefetch_disabled():
+        if request.method == 'OPTIONS':
+            return options_route('')
+        return jsonify({
+            'status': 'info',
+            'message': 'Prefetch is disabled in this environment',
+            'timestamp': datetime.now().isoformat()
+        })
+        
+    @app.route('/api/prefetch/status', methods=['GET', 'OPTIONS'])
+    def prefetch_status_disabled():
+        if request.method == 'OPTIONS':
+            return options_route('')
+        return jsonify({
+            'status': 'info',
+            'message': 'Prefetch is disabled in this environment',
+            'timestamp': datetime.now().isoformat()
+        })
+else:
+    # Add these routes for the prefetch API - only if prefetch is enabled
+    @app.route('/api/prefetch/prefetch', methods=['POST', 'OPTIONS'])
+    def prefetch_direct():
+        start_time = time.time()
+        if request.method == 'OPTIONS':
+            return options_route('')
+        
+        user_id = verify_token()
+        if not user_id:
+            return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
+        
+        # Forward to the prefetch API
+        from prefetch_api import prefetch_context
+        result = prefetch_context()
+        
+        # Add performance timing if not already present
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], dict) and 'process_time' not in result[0]:
+            result[0]['process_time'] = f"{time.time() - start_time:.2f}s"
+        return result
 
-# Register blueprints
+    @app.route('/api/prefetch/status', methods=['GET', 'OPTIONS'])
+    def prefetch_status_direct():
+        start_time = time.time()
+        if request.method == 'OPTIONS':
+            return options_route('')
+        
+        user_id = verify_token()
+        if not user_id:
+            return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
+        
+        # Forward to the prefetch API
+        from prefetch_api import get_prefetch_status
+        result = get_prefetch_status()
+        
+        # Add performance timing if not already present
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], dict) and 'process_time' not in result[0]:
+            result[0]['process_time'] = f"{time.time() - start_time:.2f}s"
+        return result
+
+# Register blueprints - but only the ones we need based on environment
 app.register_blueprint(file_api, url_prefix='/api/files')
 app.register_blueprint(user_api, url_prefix='/api/users')
-app.register_blueprint(chatbot_api, url_prefix='/api/chatbot')  # Register the chatbot API blueprint
-app.register_blueprint(prefetch_api, url_prefix='/api/prefetch')
+app.register_blueprint(chatbot_api, url_prefix='/api/chatbot')
+
+# Only register prefetch_api if enabled
+if ENABLE_PREFETCH:
+    app.register_blueprint(prefetch_api, url_prefix='/api/prefetch')
 
 # Error handlers
 @app.errorhandler(404)
@@ -850,9 +1009,31 @@ def after_request(response):
         response.headers['X-Process-Time'] = f"{process_time:.4f}s"
     return response
 
+# Perform an initial cache clearance and GC
+def perform_initial_cleanup():
+    """Clear caches and force garbage collection on startup"""
+    try:
+        clear_all_caches()
+        import gc
+        gc.collect()
+        logger.info("Initial cleanup completed")
+    except Exception as e:
+        logger.error(f"Error during initial cleanup: {e}")
+
+# Run this at startup
+perform_initial_cleanup()
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    debug_mode = os.getenv("FLASK_ENV", "production") == "development"
-    
-    logger.info(f"Starting server on port {port}, debug mode: {debug_mode}")
-    app.run(host="0.0.0.0", port=port, debug=debug_mode)
+    try:
+        port = int(os.getenv("PORT", 5000))
+        debug_mode = os.getenv("FLASK_ENV", "production") == "development"
+        
+        # In VM mode, always disable debug
+        if VM_MODE:
+            debug_mode = False
+            
+        logger.info(f"Starting server on port {port}, debug mode: {debug_mode}")
+        app.run(host="0.0.0.0", port=port, debug=debug_mode)
+    except Exception as e:
+        logger.critical(f"Failed to start server: {e}")
+        traceback.print_exc()

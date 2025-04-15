@@ -41,21 +41,37 @@ load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 VALID_API_KEYS = os.getenv("VALID_API_KEYS", "").split(",")
 VECTDB_TABLE_NAME = os.getenv("VECTDB_TABLE_NAME", "vector_files_with_10000_chunk_new")
+VM_MODE = os.getenv('VM_MODE', 'true').lower() in ('true', '1', 'yes')
 
-# Constants for chunking
-CHUNK_SIZE = 10000
-CHUNK_OVERLAP = 300
+
+# Adjust these constants based on VM mode
+if VM_MODE:
+    # Smaller settings for VM
+    CHUNK_SIZE = 5000  # Reduced from 10000
+    CHUNK_OVERLAP = 150  # Reduced from 300
+    MAX_CACHE_ENTRIES = 50  # Small cache for VM
+    CACHE_TTL_SHORT = 300    # 5 minutes
+    CACHE_TTL_MEDIUM = 1800  # 30 minutes
+    CACHE_TTL_LONG = 7200    # 2 hours
+    VECTOR_CACHE_TTL = 900   # 15 minutes
+else:
+    # Original settings for non-VM
+    CHUNK_SIZE = 10000
+    CHUNK_OVERLAP = 300
+    MAX_CACHE_ENTRIES = 1000
+    CACHE_TTL_SHORT = 600    # 10 minutes
+    CACHE_TTL_MEDIUM = 3600  # 1 hour
+    CACHE_TTL_LONG = 86400   # 24 hours
+    VECTOR_CACHE_TTL = 1800  # 30 minutes
+
+
 
 # Enhanced cache configuration with tiered expiration times
 response_cache = {}
 vector_search_cache = {}
 embedding_cache = {}  # Cache for embeddings to avoid recomputing
 model_cache = {}      # Cache for model instances
-CACHE_TTL_SHORT = 600    # 10 minutes for frequently changing content
-CACHE_TTL_MEDIUM = 3600  # 1 hour for standard content
-CACHE_TTL_LONG = 86400   # 24 hours for static content
-VECTOR_CACHE_TTL = 1800  # 30 minute cache for vector searches
-MAX_CACHE_ENTRIES = 1000  # Prevent memory bloat
+
 
 # Global embeddings instance for reuse
 _global_embeddings = None
@@ -135,10 +151,12 @@ def clean_old_cache_entries():
         current_time = time.time()
         
         with cache_lock:
-            # Clean response cache
+            # Clean response cache - use more aggressive cleaning in VM mode
+            ttl_factor = 0.5 if VM_MODE else 1.0  # In VM mode, clean at half the TTL
+            
             response_keys_to_remove = []
             for key, (_, timestamp, ttl) in response_cache.items():
-                if current_time - timestamp > ttl:
+                if current_time - timestamp > ttl * ttl_factor:
                     response_keys_to_remove.append(key)
                     
             for key in response_keys_to_remove:
@@ -147,15 +165,20 @@ def clean_old_cache_entries():
             # Clean vector search cache
             vector_keys_to_remove = []
             for key, (_, timestamp) in vector_search_cache.items():
-                if current_time - timestamp > VECTOR_CACHE_TTL:
+                if current_time - timestamp > VECTOR_CACHE_TTL * ttl_factor:
                     vector_keys_to_remove.append(key)
                     
             for key in vector_keys_to_remove:
                 del vector_search_cache[key]
                 
-            # Clean model cache periodically to refresh connections
-            if len(model_cache) > 0 and current_time % (6 * 3600) < 60:  # Every ~6 hours
+            # Clean model cache - always clean in VM mode
+            if VM_MODE or len(model_cache) > 0 and current_time % (3600) < 60:  # Every ~1 hour
                 model_cache.clear()
+                
+            # Force garbage collection in VM mode
+            if VM_MODE and (len(response_keys_to_remove) > 5 or len(vector_keys_to_remove) > 5):
+                import gc
+                gc.collect()
                 
         print(f"Cache cleaned: removed {len(response_keys_to_remove)} response entries and {len(vector_keys_to_remove)} vector search entries")
     except Exception as e:
@@ -642,6 +665,10 @@ async def parallel_vector_search(vector_store, query, k=10, source_level_url=Non
     Returns:
         List of relevant Document objects
     """
+    # Reduce k value in VM mode to improve performance
+    if VM_MODE:
+        k = 5  # Reduced from 10
+    
     # Check cache first
     cache_key = f"vecsr:{hashlib.md5((query + str(source_level_url)).encode()).hexdigest()}"
     
@@ -678,15 +705,19 @@ async def parallel_vector_search(vector_store, query, k=10, source_level_url=Non
                 search_query = f"{query} context:{domain}"
             
             # IMPROVED: Do an initial broader search first, then filter
+            # In VM mode, use a smaller multiplier to reduce search size
             future = executor.submit(
                 vector_store.similarity_search_with_relevance_scores,
                 search_query,
-                k=min(k*3, 20)  # Get more results for filtering
+                k=min(k * (2 if VM_MODE else 3), 20 if VM_MODE else 30)  # Adjusted for VM mode
             )
+            
+            # Set a shorter timeout in VM mode
+            timeout_seconds = 5 if VM_MODE else 10
             
             # Set a shorter timeout to prevent VM hanging
             doc_tuples = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: future.result(timeout=10)  # Increased timeout for better quality
+                None, lambda: future.result(timeout=timeout_seconds)
             )
             
             # Post-process the results with improved filtering
@@ -696,6 +727,10 @@ async def parallel_vector_search(vector_store, query, k=10, source_level_url=Non
             high_relevance_docs = []
             medium_relevance_docs = []
             domain_match_docs = []
+            
+            # Adjust relevance thresholds in VM mode to be more aggressive in filtering
+            high_relevance_threshold = 0.75 if VM_MODE else 0.7
+            medium_relevance_threshold = 0.6 if VM_MODE else 0.5
             
             for doc_tuple in doc_tuples:
                 doc, score = doc_tuple
@@ -709,9 +744,9 @@ async def parallel_vector_search(vector_store, query, k=10, source_level_url=Non
                         domain_match_docs.append(doc)
                 
                 # Bucket documents by relevance
-                if score > 0.7:  # Highly relevant
+                if score > high_relevance_threshold:  # Highly relevant
                     high_relevance_docs.append(doc)
-                elif score > 0.5:  # Moderately relevant
+                elif score > medium_relevance_threshold:  # Moderately relevant
                     medium_relevance_docs.append(doc)
                 elif domain_match and score > 0.3:
                     # Lower score but domain matches, so might be relevant
@@ -733,7 +768,7 @@ async def parallel_vector_search(vector_store, query, k=10, source_level_url=Non
             
             # If no filtered docs, fall back to all results above a minimum threshold
             if not filtered_docs:
-                filtered_docs = [doc for doc, score in doc_tuples if score > 0.3]
+                filtered_docs = [doc for doc, score in doc_tuples if score > (0.4 if VM_MODE else 0.3)]
             
             # If still no results, use all available results
             if not filtered_docs and doc_tuples:
@@ -754,6 +789,38 @@ async def parallel_vector_search(vector_store, query, k=10, source_level_url=Non
         except Exception as search_error:
             print(f"Error in vector search: {search_error}")
             return []  # Return empty results on error
+def force_gc():
+    """Force garbage collection to free up memory"""
+    if VM_MODE:
+        try:
+            import gc
+            memory_before = 0
+            try:
+                import psutil
+                process = psutil.Process()
+                memory_before = process.memory_info().rss / 1024 / 1024
+            except:
+                pass
+                
+            # Run garbage collection
+            collected = gc.collect(generation=2)
+            
+            # Get memory after
+            memory_after = 0
+            try:
+                import psutil
+                process = psutil.Process()
+                memory_after = process.memory_info().rss / 1024 / 1024
+            except:
+                pass
+                
+            if memory_before and memory_after:
+                print(f"GC collected {collected} objects. Memory: {memory_before:.1f}MB → {memory_after:.1f}MB ({memory_before - memory_after:.1f}MB freed)")
+            else:
+                print(f"GC collected {collected} objects")
+        except Exception as e:
+            print(f"Error during forced GC: {e}")        
+
 def direct_metadata_search(vectdb_connection, source_level_url, k=10):
     """
     Perform direct SQL metadata search for faster responses without vector search
@@ -868,7 +935,17 @@ def clear_all_caches():
         response_cache.clear()
         vector_search_cache.clear()
         embedding_cache.clear()
+        model_cache.clear()  # Also clear model cache
         print("All caches cleared")
+    
+    # Force garbage collection after clearing caches
+    if VM_MODE:
+        try:
+            import gc
+            gc.collect()
+            print("Garbage collection performed after cache clearing")
+        except:
+            pass
 def initialize_json_database(jsondb_connection):
     try:
         with jsondb_connection.cursor() as cursor:
@@ -1041,7 +1118,11 @@ def process_scrapped_text_to_vector_store(jsondb_connection, user_id=None, sourc
             if user_id:
                 query += " AND USER_ID = :user_id"
                 params["user_id"] = user_id
-            
+                
+            # In VM mode, limit the query
+            if VM_MODE:
+                query += " AND ROWNUM <= 50"  # Limit to 50 documents in VM mode
+                
             cursor.execute(query, params)
             rows = cursor.fetchall()
             
@@ -1082,7 +1163,7 @@ def process_scrapped_text_to_vector_store(jsondb_connection, user_id=None, sourc
             chunks = text_splitter.split_documents(documents)
             
             # Process in smaller batches
-            BATCH_SIZE = 5
+            BATCH_SIZE = 2 if VM_MODE else 5  # Smaller batch size in VM mode
             total_batches = (len(chunks) + BATCH_SIZE - 1) // BATCH_SIZE
             
             successful_chunks = 0
@@ -1102,10 +1183,15 @@ def process_scrapped_text_to_vector_store(jsondb_connection, user_id=None, sourc
                     failed_chunks += len(batch)
                 
                 # Less aggressive sleep to avoid rate limits but improve performance
-                time.sleep(1)
+                time.sleep(2 if VM_MODE else 1)
             
             # Clean up
             cursor.close()
+            
+            # Force garbage collection in VM mode
+            if VM_MODE:
+                import gc
+                gc.collect()
             
             return {
                 "status": "success", 
@@ -1120,7 +1206,6 @@ def process_scrapped_text_to_vector_store(jsondb_connection, user_id=None, sourc
         print(f"Error processing scrapped text: {e}")
         traceback.print_exc()
         return {"status": "error", "message": str(e), "source_level_url": source_level_url}
-
 # # Session Management Functions
 # async def create_new_session(db_conn, title="New Conversation", user_id=None):
 #     cursor = None

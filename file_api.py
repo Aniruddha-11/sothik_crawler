@@ -2301,8 +2301,7 @@ def batch_insert_links(connection, links_data):
     
 def start_crawling_and_processing(user_id, source_url, link_limit=10, auto_vectorize=True):
     """
-    Start the crawling and processing for a URL simultaneously with a shorter processing delay
-    and improved concurrency using Thread objects, and now with simultaneous vectorization
+    Start the crawling and processing for a URL with more efficient resource usage
     
     Args:
         user_id: User ID
@@ -2325,8 +2324,16 @@ def start_crawling_and_processing(user_id, source_url, link_limit=10, auto_vecto
     process_stop_event = Event()
     processing_events[process_key] = process_stop_event
     
-    # Start simultaneous vectorization if auto_vectorize is True
-    if auto_vectorize:
+    # Check if we're in VM mode
+    vm_mode = os.getenv('VM_MODE', 'true').lower() in ('true', '1', 'yes')
+    
+    # Disable auto-vectorization in VM mode unless explicitly requested
+    if vm_mode and auto_vectorize is None:
+        auto_vectorize = False
+        print(f"Auto-vectorization disabled in VM mode for {source_url}")
+    
+    # Start vectorization if auto_vectorize is True and not in VM mode
+    if auto_vectorize and not vm_mode:
         vectorization_stop_event = Event()
         vectorization_thread = start_simultaneous_vectorization(
             user_id=user_id,
@@ -2358,201 +2365,260 @@ def start_crawling_and_processing(user_id, source_url, link_limit=10, auto_vecto
         'link_limit': link_limit  # Store link_limit for sharing between threads
     }
 
-    # Define a wrapper function to start the crawling
-    def start_crawl(url, stop_event, user_id, link_limit, completion_status):
-        try:
-            print(f"Starting crawl thread for {url}, user: {user_id}, limit: {link_limit} links")
-            result = continuous_crawl_job(url, stop_event, user_id, link_limit)
-            print(f"Crawling completed with result: {result}")
-            
-            # Mark crawling as done
-            completion_status['crawling_done'] = True
-            print(f"Marked crawling as done for {url}, user: {user_id}")
-            
-            # When done, check if processing is also done
-            if completion_status['processing_done']:
-                # If both are done, start the final cool-down
-                print(f"Both crawling and processing are done, starting final cooldown for {url}")
-                start_final_cooldown(user_id, url, completion_status)
-        except Exception as e:
-            print(f"Error in crawl thread: {e}")
-            traceback.print_exc()
-            
-            # Mark crawling as done even on error
-            completion_status['crawling_done'] = True
-            print(f"Marked crawling as done (with error) for {url}, user: {user_id}")
-            
-            # If there's an error, still check if we need to start cooldown
-            if completion_status['processing_done']:
-                print(f"Processing was already done, starting final cooldown for {url} despite crawling error")
-                start_final_cooldown(user_id, url, completion_status)
-    
-    # Define a function for the processing thread with shorter delay
-    def start_processing(url, stop_event, user_id, completion_status):
-        try:
-            # Use 5 seconds delay (reduced from 15)
-            delay_seconds = 5
-            # Get the link_limit from the shared status
-            link_limit = completion_status.get('link_limit', 10)
-            print(f"Starting processing thread for {url}, user: {user_id} with {delay_seconds}s delay, link limit: {link_limit}")
-            
-            # Pass the link_limit to continuous_processing_job
-            result = continuous_processing_job(url, stop_event, delay_seconds, user_id, link_limit)
-            print(f"Processing completed with result: {result}")
-            
-            # Mark processing as done
-            completion_status['processing_done'] = True
-            print(f"Marked processing as done for {url}, user: {user_id}")
-            
-            # When done, check if crawling is also done
-            if completion_status['crawling_done']:
-                # If both are done, start the final cool-down
-                print(f"Both crawling and processing are done, starting final cooldown for {url}")
-                start_final_cooldown(user_id, url, completion_status)
-            else:
-                # Wait for crawling to finish
-                print(f"Processing finished, waiting for crawling to complete for {url}")
-        except Exception as e:
-            print(f"Error in processing thread: {e}")
-            traceback.print_exc()
-            
-            # Mark processing as done even on error
-            completion_status['processing_done'] = True
-            print(f"Marked processing as done (with error) for {url}, user: {user_id}")
-            
-            # If there's an error, still check if we need to start cooldown
-            if completion_status['crawling_done']:
-                print(f"Crawling was already done, starting final cooldown for {url} despite processing error")
-                start_final_cooldown(user_id, url, completion_status)
-    
-    # Function to start the final cool-down period (shorter duration)
-    def start_final_cooldown(user_id, url, completion_status):
-        try:
-            # Check if we're already in cooldown to prevent multiple cooldown processes
-            if completion_status.get('in_final_cooldown', False):
-                print(f"Already in final cooldown for {url}, user: {user_id}. Skipping duplicate cooldown.")
-                return
+    # Different approach in VM mode for resource efficiency
+    if vm_mode:
+        # In VM mode, use sequential processing with a single thread
+        def sequential_work():
+            try:
+                print(f"Starting sequential processing for {source_url}, user: {user_id}")
                 
-            print(f"Starting final cooldown for {url}, user: {user_id}")
-            completion_status['in_final_cooldown'] = True
-            
-            with get_jsondb_connection() as connection:
-                with connection.cursor() as cursor:
-                    # Count total links before cooldown
-                    cursor.execute("""
-                        SELECT COUNT(*) FROM {0}
-                        WHERE TOP_LEVEL_SOURCE = :url AND USER_ID = :user_id
-                    """.format(LINKS_TO_SCRAP_TABLE), 
-                       url=url, user_id=user_id)
+                # First do the crawling
+                print(f"Step 1: Crawling for {source_url}")
+                crawl_result = continuous_crawl_job(
+                    source_url, 
+                    crawl_stop_event,
+                    user_id, 
+                    link_limit
+                )
+                print(f"Crawling completed with result: {crawl_result}")
+                
+                # Then do the processing with a short delay
+                print(f"Step 2: Processing for {source_url}")
+                time.sleep(2)  # Brief delay before starting processing
+                
+                process_result = continuous_processing_job(
+                    source_url,
+                    process_stop_event,
+                    2,  # Short delay
+                    user_id,
+                    link_limit
+                )
+                print(f"Processing completed with result: {process_result}")
+                
+                # Mark as complete and process next
+                print(f"Step 3: Completing job for {source_url}")
+                mark_as_complete_and_process_next(user_id, source_url, auto_vectorize)
+                
+            except Exception as e:
+                print(f"Error in sequential work: {e}")
+                traceback.print_exc()
+                
+                # Clean up on error
+                if user_id in active_user_jobs and source_url in active_user_jobs[user_id]:
+                    active_user_jobs[user_id].remove(source_url)
+                    if not active_user_jobs[user_id]:
+                        del active_user_jobs[user_id]
+                
+                # Try to mark as complete anyway
+                try:
+                    mark_as_complete_and_process_next(user_id, source_url, False)
+                except:
+                    pass
+        
+        # Just use a single thread for VM mode
+        worker = Thread(target=sequential_work, daemon=True)
+        worker.start()
+        print(f"Started sequential processing for {source_url}")
+        
+        return True
+    else:
+        # In non-VM mode, use the original parallel approach
+        
+        # Define a wrapper function to start the crawling
+        def start_crawl(url, stop_event, user_id, link_limit, completion_status):
+            try:
+                print(f"Starting crawl thread for {url}, user: {user_id}, limit: {link_limit} links")
+                result = continuous_crawl_job(url, stop_event, user_id, link_limit)
+                print(f"Crawling completed with result: {result}")
+                
+                # Mark crawling as done
+                completion_status['crawling_done'] = True
+                print(f"Marked crawling as done for {url}, user: {user_id}")
+                
+                # When done, check if processing is also done
+                if completion_status['processing_done']:
+                    # If both are done, start the final cool-down
+                    print(f"Both crawling and processing are done, starting final cooldown for {url}")
+                    start_final_cooldown(user_id, url, completion_status)
+            except Exception as e:
+                print(f"Error in crawl thread: {e}")
+                traceback.print_exc()
+                
+                # Mark crawling as done even on error
+                completion_status['crawling_done'] = True
+                print(f"Marked crawling as done (with error) for {url}, user: {user_id}")
+                
+                # If there's an error, still check if we need to start cooldown
+                if completion_status['processing_done']:
+                    print(f"Processing was already done, starting final cooldown for {url} despite crawling error")
+                    start_final_cooldown(user_id, url, completion_status)
+    
+        # Define a function for the processing thread with shorter delay
+        def start_processing(url, stop_event, user_id, completion_status):
+            try:
+                # Use 5 seconds delay (reduced from 15)
+                delay_seconds = 5
+                # Get the link_limit from the shared status
+                link_limit = completion_status.get('link_limit', 10)
+                print(f"Starting processing thread for {url}, user: {user_id} with {delay_seconds}s delay, link limit: {link_limit}")
+                
+                # Pass the link_limit to continuous_processing_job
+                result = continuous_processing_job(url, stop_event, delay_seconds, user_id, link_limit)
+                print(f"Processing completed with result: {result}")
+                
+                # Mark processing as done
+                completion_status['processing_done'] = True
+                print(f"Marked processing as done for {url}, user: {user_id}")
+                
+                # When done, check if crawling is also done
+                if completion_status['crawling_done']:
+                    # If both are done, start the final cool-down
+                    print(f"Both crawling and processing are done, starting final cooldown for {url}")
+                    start_final_cooldown(user_id, url, completion_status)
+                else:
+                    # Wait for crawling to finish
+                    print(f"Processing finished, waiting for crawling to complete for {url}")
+            except Exception as e:
+                print(f"Error in processing thread: {e}")
+                traceback.print_exc()
+                
+                # Mark processing as done even on error
+                completion_status['processing_done'] = True
+                print(f"Marked processing as done (with error) for {url}, user: {user_id}")
+                
+                # If there's an error, still check if we need to start cooldown
+                if completion_status['crawling_done']:
+                    print(f"Crawling was already done, starting final cooldown for {url} despite processing error")
+                    start_final_cooldown(user_id, url, completion_status)
+    
+        # Function to start the final cool-down period (shorter duration)
+        def start_final_cooldown(user_id, url, completion_status):
+            try:
+                # Check if we're already in cooldown to prevent multiple cooldown processes
+                if completion_status.get('in_final_cooldown', False):
+                    print(f"Already in final cooldown for {url}, user: {user_id}. Skipping duplicate cooldown.")
+                    return
                     
-                    completion_status['links_before_cooldown'] = cursor.fetchone()[0]
-                    
-                    # Reduced cooldown from 40 to 20 seconds for faster completion
-                    cooldown_duration = 20  # 20 seconds 
-                    cooldown_start_time = time.time()
-                    
-                    # Check for new links every 5 seconds during the cool-down period
-                    while time.time() - cooldown_start_time < cooldown_duration:
-                        # Skip if the stop events are set
-                        if crawl_key in crawling_events and crawling_events[crawl_key].is_set():
-                            print(f"Crawling stop event is set during cooldown for {url}. Terminating cooldown.")
-                            break
-                            
-                        if process_key in processing_events and processing_events[process_key].is_set():
-                            print(f"Processing stop event is set during cooldown for {url}. Terminating cooldown.")
-                            break
-                        
-                        # Calculate remaining time
-                        elapsed = time.time() - cooldown_start_time
-                        remaining = cooldown_duration - elapsed
-                        print(f"In final cool-down period. {remaining:.1f} seconds remaining. Checking for new links...")
-                        
-                        # Check if any new links have been discovered
+                print(f"Starting final cooldown for {url}, user: {user_id}")
+                completion_status['in_final_cooldown'] = True
+                
+                with get_jsondb_connection() as connection:
+                    with connection.cursor() as cursor:
+                        # Count total links before cooldown
                         cursor.execute("""
                             SELECT COUNT(*) FROM {0}
                             WHERE TOP_LEVEL_SOURCE = :url AND USER_ID = :user_id
                         """.format(LINKS_TO_SCRAP_TABLE), 
                            url=url, user_id=user_id)
                         
-                        current_link_count = cursor.fetchone()[0]
+                        completion_status['links_before_cooldown'] = cursor.fetchone()[0]
                         
-                        # Check if any links still need processing
-                        cursor.execute("""
-                            SELECT COUNT(*) FROM {0}
-                            WHERE TOP_LEVEL_SOURCE = :url AND USER_ID = :user_id
-                            AND (IS_PROCESSED = 'false' OR IS_PROCESSED IS NULL)
-                        """.format(LINKS_TO_SCRAP_TABLE), 
-                           url=url, user_id=user_id)
+                        # Reduced cooldown from 40 to 20 seconds for faster completion
+                        cooldown_duration = 20  # 20 seconds 
+                        cooldown_start_time = time.time()
                         
-                        unprocessed_count = cursor.fetchone()[0]
-                        
-                        if current_link_count > completion_status['links_before_cooldown'] or unprocessed_count > 0:
-                            print(f"New links discovered during cool-down! Links before: {completion_status['links_before_cooldown']}, Current: {current_link_count}, Unprocessed: {unprocessed_count}")
-                            print(f"Restarting crawling and processing for {url}")
+                        # Check for new links every 5 seconds during the cool-down period
+                        while time.time() - cooldown_start_time < cooldown_duration:
+                            # Skip if the stop events are set
+                            if crawl_key in crawling_events and crawling_events[crawl_key].is_set():
+                                print(f"Crawling stop event is set during cooldown for {url}. Terminating cooldown.")
+                                break
+                                
+                            if process_key in processing_events and processing_events[process_key].is_set():
+                                print(f"Processing stop event is set during cooldown for {url}. Terminating cooldown.")
+                                break
                             
-                            # Reset completion status
-                            completion_status['crawling_done'] = False
-                            completion_status['processing_done'] = False
-                            completion_status['in_final_cooldown'] = False
+                            # Calculate remaining time
+                            elapsed = time.time() - cooldown_start_time
+                            remaining = cooldown_duration - elapsed
+                            print(f"In final cool-down period. {remaining:.1f} seconds remaining. Checking for new links...")
                             
-                            # Start the crawling and processing again
-                            if unprocessed_count > 0 or current_link_count > completion_status['links_before_cooldown']:
-                                # Get the link_limit from the shared status
-                                link_limit = completion_status.get('link_limit', 10)
+                            # Check if any new links have been discovered
+                            cursor.execute("""
+                                SELECT COUNT(*) FROM {0}
+                                WHERE TOP_LEVEL_SOURCE = :url AND USER_ID = :user_id
+                            """.format(LINKS_TO_SCRAP_TABLE), 
+                               url=url, user_id=user_id)
+                            
+                            current_link_count = cursor.fetchone()[0]
+                            
+                            # Check if any links still need processing
+                            cursor.execute("""
+                                SELECT COUNT(*) FROM {0}
+                                WHERE TOP_LEVEL_SOURCE = :url AND USER_ID = :user_id
+                                AND (IS_PROCESSED = 'false' OR IS_PROCESSED IS NULL)
+                            """.format(LINKS_TO_SCRAP_TABLE), 
+                               url=url, user_id=user_id)
+                            
+                            unprocessed_count = cursor.fetchone()[0]
+                            
+                            if current_link_count > completion_status['links_before_cooldown'] or unprocessed_count > 0:
+                                print(f"New links discovered during cool-down! Links before: {completion_status['links_before_cooldown']}, Current: {current_link_count}, Unprocessed: {unprocessed_count}")
+                                print(f"Restarting crawling and processing for {url}")
                                 
-                                # Start the crawl thread again
-                                new_crawl_thread = Thread(
-                                    target=start_crawl,
-                                    args=(url, crawl_stop_event, user_id, link_limit, completion_status),
-                                    daemon=True
-                                )
-                                new_crawl_thread.start()
+                                # Reset completion status
+                                completion_status['crawling_done'] = False
+                                completion_status['processing_done'] = False
+                                completion_status['in_final_cooldown'] = False
                                 
-                                # Start the process thread again
-                                new_process_thread = Thread(
-                                    target=start_processing,
-                                    args=(url, process_stop_event, user_id, completion_status),
-                                    daemon=True
-                                )
-                                new_process_thread.start()
-                                
-                                # Exit this cool-down function to let the new threads handle it
-                                return
+                                # Start the crawling and processing again
+                                if unprocessed_count > 0 or current_link_count > completion_status['links_before_cooldown']:
+                                    # Get the link_limit from the shared status
+                                    link_limit = completion_status.get('link_limit', 10)
+                                    
+                                    # Start the crawl thread again
+                                    new_crawl_thread = Thread(
+                                        target=start_crawl,
+                                        args=(url, crawl_stop_event, user_id, link_limit, completion_status),
+                                        daemon=True
+                                    )
+                                    new_crawl_thread.start()
+                                    
+                                    # Start the process thread again
+                                    new_process_thread = Thread(
+                                        target=start_processing,
+                                        args=(url, process_stop_event, user_id, completion_status),
+                                        daemon=True
+                                    )
+                                    new_process_thread.start()
+                                    
+                                    # Exit this cool-down function to let the new threads handle it
+                                    return
+                            
+                            # Sleep for 3 seconds before checking again (reduced from 5)
+                            time.sleep(3)
                         
-                        # Sleep for 3 seconds before checking again (reduced from 5)
-                        time.sleep(3)
-                    
-                    # Cool-down period has elapsed with no new links
-                    print(f"Final cool-down period of {cooldown_duration} seconds has elapsed. No new links found. Completing job for {url}")
-                    
-                    # Pass auto_vectorize flag when marking as complete
-                    mark_as_complete_and_process_next(user_id, url, completion_status['auto_vectorize'])
-                    
-        except Exception as e:
-            print(f"Error in final cool-down: {str(e)}")
-            traceback.print_exc()
-            
-            # Even if there's an error, try to move to the next URL
-            mark_as_complete_and_process_next(user_id, url, completion_status['auto_vectorize'])
-    
-    # Start the crawling in a background thread
-    crawler_thread = Thread(
-        target=start_crawl,
-        args=(source_url, crawl_stop_event, user_id, link_limit, completion_status),
-        daemon=True
-    )
-    crawler_thread.start()
-    
-    # Start the processing in a background thread (with shorter delay)
-    processor_thread = Thread(
-        target=start_processing,
-        args=(source_url, process_stop_event, user_id, completion_status),
-        daemon=True
-    )
-    processor_thread.start()
-    
-    print(f"Started simultaneous crawling and processing for {source_url}, user {user_id}, link_limit: {link_limit}, auto_vectorize: {auto_vectorize}")
-    return True
+                        # Cool-down period has elapsed with no new links
+                        print(f"Final cool-down period of {cooldown_duration} seconds has elapsed. No new links found. Completing job for {url}")
+                        
+                        # Pass auto_vectorize flag when marking as complete
+                        mark_as_complete_and_process_next(user_id, url, completion_status['auto_vectorize'])
+                        
+            except Exception as e:
+                print(f"Error in final cool-down: {str(e)}")
+                traceback.print_exc()
+                
+                # Even if there's an error, try to move to the next URL
+                mark_as_complete_and_process_next(user_id, url, completion_status['auto_vectorize'])
+                
+        # Start the crawling in a background thread
+        crawler_thread = Thread(
+            target=start_crawl,
+            args=(source_url, crawl_stop_event, user_id, link_limit, completion_status),
+            daemon=True
+        )
+        crawler_thread.start()
+        
+        # Start the processing in a background thread (with shorter delay)
+        processor_thread = Thread(
+            target=start_processing,
+            args=(source_url, process_stop_event, user_id, completion_status),
+            daemon=True
+        )
+        processor_thread.start()
+        
+        print(f"Started simultaneous crawling and processing for {source_url}, user {user_id}, link_limit: {link_limit}, auto_vectorize: {auto_vectorize}")
+        return True
 
 def mark_as_complete_and_process_next(user_id, source_url, auto_vectorize=True):
     """

@@ -40,6 +40,10 @@ RETRY_DELAY = 1
 jsondb_connection_pool = None
 vectdb_connection_pool = None
 
+# Check if we're in VM mode
+VM_MODE = os.getenv('VM_MODE', 'true').lower() in ('true', '1', 'yes')
+logger.info(f"Running in VM mode: {VM_MODE}")
+
 def initialize_session(connection, requested_tag):
     """Session callback to initialize each connection in the pool"""
     cursor = connection.cursor()
@@ -62,25 +66,54 @@ def initialize_jsondb_connection_pool(use_wallet=True):
         return True
     
     try:
-        # Optimized pool parameters
-        pool_params = {
-            "user": ORACLE_USER,
-            "password": ORACLE_PASSWORD,
-            "dsn": ORACLE_DSN,
-            "min": 5,          # Minimum connections
-            "max": 30,         # Maximum connections
-            "increment": 5,    # Increment for better scalability
-            "getmode": oracledb.POOL_GETMODE_WAIT,  # Wait for available connection
-            "wait_timeout": 10000,  # 10 seconds wait timeout
-            "max_lifetime_session": 28800,  # 8 hours
-            "session_callback": initialize_session  # Add session callback for setup
-        }
+        # Check if wallet directory exists
+        if use_wallet:
+            wallet_path = "Wallet_jsondb"
+            if not os.path.exists(wallet_path):
+                logger.error(f"Wallet path {wallet_path} does not exist!")
+                # Try to find the wallet in the current directory
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                alternative_path = os.path.join(current_dir, wallet_path)
+                if os.path.exists(alternative_path):
+                    wallet_path = alternative_path
+                    logger.info(f"Found wallet at alternative path: {wallet_path}")
+                else:
+                    logger.error(f"Could not find wallet at alternative path: {alternative_path}")
+                    return False
+        
+        # Optimized pool parameters - more conservative in VM mode
+        if VM_MODE:
+            pool_params = {
+                "user": ORACLE_USER,
+                "password": ORACLE_PASSWORD,
+                "dsn": ORACLE_DSN,
+                "min": 1,          # Minimum connections reduced to 1
+                "max": 5,          # Maximum connections significantly reduced
+                "increment": 1,    # Grow pool one connection at a time
+                "getmode": oracledb.POOL_GETMODE_WAIT,
+                "wait_timeout": 5000,  # 5 seconds wait timeout
+                "max_lifetime_session": 3600,  # 1 hour
+                "session_callback": initialize_session
+            }
+        else:
+            pool_params = {
+                "user": ORACLE_USER,
+                "password": ORACLE_PASSWORD,
+                "dsn": ORACLE_DSN,
+                "min": 2,          # Minimum connections
+                "max": 10,         # Maximum connections
+                "increment": 2,    # Increment for better scalability
+                "getmode": oracledb.POOL_GETMODE_WAIT,
+                "wait_timeout": 10000,  # 10 seconds wait timeout
+                "max_lifetime_session": 7200,  # 2 hours
+                "session_callback": initialize_session
+            }
         
         # Add wallet parameters if using wallet authentication
         if use_wallet:
             pool_params.update({
-                "config_dir": "Wallet_jsondb",
-                "wallet_location": "Wallet_jsondb",
+                "config_dir": wallet_path,
+                "wallet_location": wallet_path,
                 "wallet_password": ORACLE_PASSWORD
             })
         
@@ -104,25 +137,54 @@ def initialize_vectdb_connection_pool(use_wallet=True):
         return True
     
     try:
-        # Optimized pool parameters
-        pool_params = {
-            "user": ORACLE_USER_VECTDB,
-            "password": ORACLE_PASSWORD,
-            "dsn": ORACLE_DSN_VECTDB,
-            "min": 3,          # Minimum connections
-            "max": 20,         # Maximum connections
-            "increment": 3,    # Increment for better scalability
-            "getmode": oracledb.POOL_GETMODE_WAIT,  # Wait for available connection
-            "wait_timeout": 10000,  # 10 seconds wait timeout
-            "max_lifetime_session": 28800,  # 8 hours
-            "session_callback": initialize_session  # Add session callback for setup
-        }
+        # Check if wallet directory exists
+        if use_wallet:
+            wallet_path = "Wallet_VECTDB"
+            if not os.path.exists(wallet_path):
+                logger.error(f"Wallet path {wallet_path} does not exist!")
+                # Try to find the wallet in the current directory
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                alternative_path = os.path.join(current_dir, wallet_path)
+                if os.path.exists(alternative_path):
+                    wallet_path = alternative_path
+                    logger.info(f"Found wallet at alternative path: {wallet_path}")
+                else:
+                    logger.error(f"Could not find wallet at alternative path: {alternative_path}")
+                    return False
+        
+        # Optimized pool parameters - more conservative in VM mode
+        if VM_MODE:
+            pool_params = {
+                "user": ORACLE_USER_VECTDB,
+                "password": ORACLE_PASSWORD,
+                "dsn": ORACLE_DSN_VECTDB,
+                "min": 1,          # Minimum connections reduced to 1
+                "max": 3,          # Maximum connections significantly reduced
+                "increment": 1,    # Grow pool one connection at a time
+                "getmode": oracledb.POOL_GETMODE_WAIT,
+                "wait_timeout": 5000,  # 5 seconds wait timeout
+                "max_lifetime_session": 3600,  # 1 hour
+                "session_callback": initialize_session
+            }
+        else:
+            pool_params = {
+                "user": ORACLE_USER_VECTDB,
+                "password": ORACLE_PASSWORD,
+                "dsn": ORACLE_DSN_VECTDB,
+                "min": 1,          # Minimum connections
+                "max": 5,          # Maximum connections
+                "increment": 1,    # Increment for better scalability
+                "getmode": oracledb.POOL_GETMODE_WAIT,
+                "wait_timeout": 10000,  # 10 seconds wait timeout
+                "max_lifetime_session": 7200,  # 2 hours
+                "session_callback": initialize_session
+            }
         
         # Add wallet parameters if using wallet authentication
         if use_wallet:
             pool_params.update({
-                "config_dir": "Wallet_VECTDB",
-                "wallet_location": "Wallet_VECTDB",
+                "config_dir": wallet_path,
+                "wallet_location": wallet_path,
                 "wallet_password": ORACLE_PASSWORD
             })
         
@@ -157,12 +219,19 @@ def get_jsondb_connection(use_wallet=True):
             else:
                 # Choose connection method based on use_wallet parameter
                 if use_wallet:
+                    wallet_path = "Wallet_jsondb"
+                    if not os.path.exists(wallet_path):
+                        current_dir = os.path.dirname(os.path.abspath(__file__))
+                        alternative_path = os.path.join(current_dir, wallet_path)
+                        if os.path.exists(alternative_path):
+                            wallet_path = alternative_path
+                    
                     conn = oracledb.connect(
                         user=ORACLE_USER,
                         password=ORACLE_PASSWORD,
                         dsn=ORACLE_DSN,
-                        config_dir="Wallet_jsondb",
-                        wallet_location="Wallet_jsondb",
+                        config_dir=wallet_path,
+                        wallet_location=wallet_path,
                         wallet_password=ORACLE_PASSWORD
                     )
                     logger.debug("Created new JSON DB connection with wallet")
@@ -251,12 +320,19 @@ def get_vectdb_connection(use_wallet=True):
             else:
                 # Choose connection method based on use_wallet parameter
                 if use_wallet:
+                    wallet_path = "Wallet_VECTDB"
+                    if not os.path.exists(wallet_path):
+                        current_dir = os.path.dirname(os.path.abspath(__file__))
+                        alternative_path = os.path.join(current_dir, wallet_path)
+                        if os.path.exists(alternative_path):
+                            wallet_path = alternative_path
+                    
                     conn = oracledb.connect(
                         user=ORACLE_USER_VECTDB,
                         password=ORACLE_PASSWORD,
                         dsn=ORACLE_DSN_VECTDB,
-                        config_dir="Wallet_VECTDB",
-                        wallet_location="Wallet_VECTDB",
+                        config_dir=wallet_path,
+                        wallet_location=wallet_path,
                         wallet_password=ORACLE_PASSWORD
                     )
                     logger.debug("Created new Vector DB connection with wallet")
@@ -269,6 +345,31 @@ def get_vectdb_connection(use_wallet=True):
                     logger.debug("Created new direct Vector DB connection")
                 
             yield conn
+            
+            # Proper cleanup after yield
+            try:
+                if conn and not conn.autocommit:
+                    conn.commit()
+            except Exception as commit_error:
+                logger.error(f"Error committing Vector DB transaction: {commit_error}")
+                if conn:
+                    try:
+                        conn.rollback()
+                    except:
+                        pass
+            finally:
+                if conn:
+                    try:
+                        if vectdb_connection_pool and isinstance(conn, oracledb.Connection):
+                            vectdb_connection_pool.release(conn)
+                            logger.debug("Released connection back to Vector DB pool")
+                        else:
+                            conn.close()
+                            logger.debug("Closed direct Vector DB connection")
+                    except Exception as close_error:
+                        logger.error(f"Error closing Vector DB connection: {close_error}")
+                    conn = None
+                        
             return  # Ensure the generator exits properly
         except oracledb.DatabaseError as e:
             retries += 1
@@ -279,6 +380,7 @@ def get_vectdb_connection(use_wallet=True):
                     conn.close()
                 except:
                     pass
+                conn = None
                     
             # Wait before retrying with exponential backoff
             time.sleep(RETRY_DELAY * (2 ** (retries - 1)))
@@ -291,20 +393,11 @@ def get_vectdb_connection(use_wallet=True):
                     conn.close()
                 except:
                     pass
+                conn = None
             
             raise
-        finally:
-            if conn:
-                try:
-                    if vectdb_connection_pool and isinstance(conn, oracledb.Connection):
-                        vectdb_connection_pool.release(conn)
-                        logger.debug("Released connection back to Vector DB pool")
-                    else:
-                        conn.close()
-                        logger.debug("Closed direct Vector DB connection")
-                except Exception as close_error:
-                    logger.error(f"Error closing Vector DB connection: {close_error}")
-
+    
+    # If we reach here after MAX_RETRIES, raise an exception
     raise Exception(f"Failed to establish Vector DB connection after {MAX_RETRIES} attempts")
 
 def connect_to_jsondb(use_wallet=True):
@@ -328,13 +421,22 @@ def connect_to_jsondb(use_wallet=True):
                 # Fall through to direct connection
         
         if use_wallet:
+            # Check wallet path
+            wallet_path = "Wallet_jsondb"
+            if not os.path.exists(wallet_path):
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                alternative_path = os.path.join(current_dir, wallet_path)
+                if os.path.exists(alternative_path):
+                    wallet_path = alternative_path
+                    logger.info(f"Using alternative wallet path: {wallet_path}")
+            
             # Use wallet-based authentication (how your application currently connects)
             connection = oracledb.connect(
                 user=ORACLE_USER,
                 password=ORACLE_PASSWORD,
                 dsn=ORACLE_DSN,
-                config_dir="Wallet_jsondb",
-                wallet_location="Wallet_jsondb",
+                config_dir=wallet_path,
+                wallet_location=wallet_path,
                 wallet_password=ORACLE_PASSWORD
             )
         else:
@@ -373,13 +475,22 @@ def connect_to_vectdb(use_wallet=True):
                 # Fall through to direct connection
         
         if use_wallet:
+            # Check wallet path
+            wallet_path = "Wallet_VECTDB"
+            if not os.path.exists(wallet_path):
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                alternative_path = os.path.join(current_dir, wallet_path)
+                if os.path.exists(alternative_path):
+                    wallet_path = alternative_path
+                    logger.info(f"Using alternative wallet path: {wallet_path}")
+            
             # Use wallet-based authentication (how your application currently connects)
             connection = oracledb.connect(
                 user=ORACLE_USER_VECTDB,
                 password=ORACLE_PASSWORD,
                 dsn=ORACLE_DSN_VECTDB,
-                config_dir="Wallet_VECTDB",
-                wallet_location="Wallet_VECTDB",
+                config_dir=wallet_path,
+                wallet_location=wallet_path,
                 wallet_password=ORACLE_PASSWORD
             )
         else:
@@ -416,7 +527,7 @@ def execute_query(connection, query, params=None, fetch_all=True):
         
         # Set array size for better fetch performance when fetching many rows
         if fetch_all:
-            cursor.arraysize = 100
+            cursor.arraysize = 100 if not VM_MODE else 20  # Smaller array size in VM mode
             
         if params:
             cursor.execute(query, params)
@@ -460,6 +571,10 @@ def execute_batch_query(connection, query, params_list, commit_every=10):
     
     try:
         cursor = connection.cursor()
+        
+        # In VM mode, use smaller commit batches
+        if VM_MODE:
+            commit_every = min(5, commit_every)
         
         for i, params in enumerate(params_list):
             try:
@@ -571,7 +686,6 @@ def check_connection_pools():
         traceback.print_exc()
         return {'error': str(e)}
 
-# Initialize connection pools on module import
-# Default to wallet-based authentication for compatibility with existing code
+# Initialize connection pools on module import - but with lighter settings
 initialize_jsondb_connection_pool(use_wallet=True)
 initialize_vectdb_connection_pool(use_wallet=True)
